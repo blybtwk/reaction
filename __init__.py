@@ -21,7 +21,7 @@ def _fmt_time(dt):
 
 def build_reaction_context(messages, operator, locale, trigger_time="",
                            max_context=5, max_after=4,
-                           max_images=3, max_hours=5.0):
+                           max_images=3, max_hours=5.0, context_mode="legacy"):
     """纯逻辑部分，不依赖 ComfyUI，方便单独测试。
 
     messages: [{"sender": "mia", "time": "2026-11-18T10:00:00Z", "text": "..."},
@@ -30,7 +30,10 @@ def build_reaction_context(messages, operator, locale, trigger_time="",
     """
     if not isinstance(messages, list) or not messages:
         raise ValueError("messages 必须是非空数组")
-    if not 1 <= max_images <= 3 or max_context < 1 or max_after < 0 or max_hours <= 0:
+    if context_mode not in ("legacy", "upstream_filtered"):
+        raise ValueError("不支持的 context_mode")
+    upstream_filtered = context_mode == "upstream_filtered"
+    if not upstream_filtered and (not 1 <= max_images <= 3 or max_context < 1 or max_after < 0 or max_hours <= 0):
         raise ValueError("窗口或图片数量参数无效")
     for m in messages:
         if not isinstance(m, dict) or not isinstance(m.get("sender"), str):
@@ -42,17 +45,19 @@ def build_reaction_context(messages, operator, locale, trigger_time="",
     t_trigger = _parse_time(trigger_time) if trigger_time.strip() else times[-1]
     cutoff = t_trigger - timedelta(hours=max_hours)
     img_order = [i for i, m in enumerate(messages) if m.get("image")]
+    if upstream_filtered and len(img_order) > 3:
+        raise ValueError("upstream_filtered 最多支持 3 张真实图；更早图片请用 text 或 image_summary 传摘要，不设 image=true")
     src_index = {msg_i: k for k, msg_i in enumerate(img_order)}
-    past = [i for i, t in enumerate(times) if t <= t_trigger]
+    past = list(range(len(messages))) if upstream_filtered else [i for i, t in enumerate(times) if t <= t_trigger]
     cands = [i for i in past if messages[i].get("image") and messages[i]["sender"] != operator]
-    base_info = {"trigger_time": _fmt_time(t_trigger), "trigger_time_source": trigger_time_source}
+    base_info = {"context_mode": context_mode, "trigger_time": _fmt_time(t_trigger), "trigger_time_source": trigger_time_source}
     if not cands:
         return {**base_info, "recommend": False, "reason": "触发时间之前没有别人发的图"}
     target = cands[-1]
-    if times[target] < cutoff:
+    if not upstream_filtered and times[target] < cutoff:
         return {**base_info, "recommend": False, "reason": "目标图已超出时间窗口"}
     after = len([i for i in past if i > target])
-    recommend = after <= max_after
+    recommend = upstream_filtered or after <= max_after
     reason = "ok" if recommend else f"目标图之后已有 {after} 条消息，超过 {max_after} 条，不显示入口"
 
     eligible = [i for i in past if times[i] >= cutoff]
@@ -60,6 +65,11 @@ def build_reaction_context(messages, operator, locale, trigger_time="",
     remaining = max_context - 1 - len(following)
     preceding = [i for i in eligible if i < target]
     window = (preceding[-remaining:] if remaining else []) + [target] + following
+
+    if upstream_filtered:
+        # Upstream owns eligibility/windowing; preserve every supplied summary and image.
+        window = list(range(len(messages)))
+        max_images = 3
 
     # 3. 选图：目标图 + 离它最近的 max_images-1 张
     win_imgs = [i for i in window if messages[i].get("image")]
@@ -86,6 +96,13 @@ def build_reaction_context(messages, operator, locale, trigger_time="",
                     lines.append(head + "[image_omitted]")
             else:
                 lines.append(head + json.dumps(m.get("text", ""), ensure_ascii=False))
+            # Image summaries are text context, never image placeholders or target candidates.
+            if "image_summary" in m:
+                if not isinstance(m["image_summary"], str):
+                    raise ValueError("image_summary 必须是字符串")
+                lines.append(head + "[历史图片摘要] " + json.dumps(m["image_summary"], ensure_ascii=False))
+            if m.get("image") and m.get("text"):
+                lines.append(head + json.dumps(m["text"], ensure_ascii=False))
         return lines
 
     header = [f"[locale={locale}]", trigger, "以下是用户之间的聊天记录（按时间先后排列）："]
@@ -121,6 +138,7 @@ class ReactionContextBuilder:
                 "max_hours": ("FLOAT", {"default": 5.0, "min": 0.1, "max": 72.0}),
             },
             "optional": {
+                "context_mode": (["legacy", "upstream_filtered"], {"default": "legacy"}),
                 "trigger_time": ("STRING", {"default": ""}),
                 "src_image_1": ("IMAGE",), "src_image_2": ("IMAGE",), "src_image_3": ("IMAGE",),
                 "src_image_4": ("IMAGE",), "src_image_5": ("IMAGE",),
@@ -134,18 +152,20 @@ class ReactionContextBuilder:
     CATEGORY = "Reaction"
 
     def run(self, messages_json, operator, locale, max_context,
-            max_after, max_images, max_hours, trigger_time="", **imgs):
+            max_after, max_images, max_hours, trigger_time="", context_mode="legacy", **imgs):
         messages = json.loads(messages_json)
         if not isinstance(messages, list):
             raise ValueError("messages_json 必须是数组")
         image_count = sum(bool(m.get("image")) for m in messages if isinstance(m, dict))
+        if context_mode == "upstream_filtered" and image_count > 3:
+            raise ValueError("upstream_filtered 最多支持 3 张真实图；更早图片请传文字摘要")
         if image_count > 5:
             raise ValueError("对话最多支持 5 张源图，请先裁剪输入对话")
         for k in range(1, image_count + 1):
             if imgs.get(f"src_image_{k}") is None:
                 raise ValueError(f"缺少 src_image_{k}：对话里的图必须按出现顺序接满")
         r = build_reaction_context(messages, operator, locale, trigger_time,
-                                   max_context, max_after, max_images, max_hours)
+                                   max_context, max_after, max_images, max_hours, context_mode)
         if "planner_input" not in r:
             return ("", "", 0, None, None, None, None, json.dumps(r, ensure_ascii=False))
 
@@ -153,7 +173,7 @@ class ReactionContextBuilder:
         slots = [src[k] if k < len(src) else None for k in r["slot_map"]]
         slots += [None] * (3 - len(slots))
         target_img = slots[r["target_index"] - 1]
-        info = json.dumps({k: r[k] for k in ("recommend", "reason", "target_index",
+        info = json.dumps({k: r[k] for k in ("context_mode", "recommend", "reason", "target_index",
                                              "target_label", "slot_map", "trigger_time", "trigger_time_source")}, ensure_ascii=False)
         return (r["planner_input"], r["creator_context"], r["target_index"],
                 slots[0], slots[1], slots[2], target_img, info)

@@ -29,3 +29,23 @@ Planner 图片端口接 user_image_1–3，Creator 和 Renderer 仅接 target_im
 ## 验证
 
 运行 `python3 -m unittest discover -s tests -v`。测试包括单图空输出、缺图报错、超过五张、UTC 转换、时间边界、未来消息排除、过期目标、自动目标、JSON 提取和确定性选择。必须另外在 BA 将空输出实际接到 Planner 并运行单图 case。
+
+## 2026-11-19：端上已过滤的新协议
+
+新增可选输入 `context_mode`：`legacy`（默认，旧 workflow 兼容）或 `upstream_filtered`（新 workflow 必须显式设置）。不改变原输出名称或索引。
+
+`upstream_filtered` 信任端上已完成资格和时间窗口处理：不再按 5 小时、目标图后消息数量或 max_context 截断，也不按 trigger_time 排除消息。保留传入的全部聊天和摘要，最多 3 张真实图片全部按时间顺序编号；旧 max_images 值不会把它们裁掉。仍校验带时区时间戳和顺序、图片数不超过 3、真实图按出现顺序接满。目标图仍是输入中最近一张非 operator 发出的真实图片；摘要不会成为目标图。找不到真实目标图时返回空输出及 reason；`recommend` 是兼容字段，不表示重新执行了端上推荐规则。
+
+源图片输入仍兼容 src_image_1–5，但新协议只用前 3 个；缺少的 user_image 槽位保持 None，目标图来自同一个计算结果。trigger_time 仍用于记录和展示；为空时按最后消息时间，info 标注来源。info 新增 context_mode。
+
+历史图片摘要可以直接作为普通 `text` 消息，或者使用明确的 `image_summary` 字符串字段；摘要消息**不要**标记 `image: true`。只有真实附图消息才写 `image: true` 并连接实际图片。摘要不消耗槽位、不要求原图。附图同条的 text 和 image_summary 也会保留。
+
+```json
+[
+  {"sender":"mia","time":"2026-11-18T09:00:00Z","image_summary":"更早的照片里是一只坐在窗边的橘猫。"},
+  {"sender":"mia","time":"2026-11-19T10:00:00Z","image":true,"text":"今天这个状态怎么样？"},
+  {"sender":"lily","time":"2026-11-19T10:01:00Z","text":"让我想个回应"}
+]
+```
+
+本次只运行新协议测试 `python3 -m unittest discover -s tests -p test_upstream_filtered.py -v`：8 项通过，覆盖摘要保留与不占槽位、三图顺序及目标身份、缺图和超 3 图错误、单图空输出、附图文本保留、旧默认兼容与非法模式。没有重新做旧 5h/后4条资格过滤测试。此结果为纯 Python 逻辑验证，不代表 BA 已部署新版。
